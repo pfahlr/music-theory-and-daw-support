@@ -18,6 +18,7 @@ Tabs: 2 spaces
 
 import argparse
 import os
+from typing import Sequence
 import random
 import re
 import sys
@@ -360,30 +361,59 @@ GENRE_SHEETS: Dict[str, Dict[str, str | List[str]]] = {
 }
 
 def realize_chords_md(deg_by_col: Sequence[str], key_name: str, mode_name: str) -> str:
+  # (same robust version you just fixed: Key(key, mode) not f"{key} {mode}")
   if m21key is None or m21roman is None:
-    return "# Chords\n\n(music21 not installed; no chord doc generated.)\n"
+    return ""
   mode_to_quality = {
-    "ionian": "major",
-    "dorian": "dorian",
-    "phrygian": "phrygian",
-    "lydian": "lydian",
-    "mixolydian": "mixolydian",
-    "aeolian": "minor",
-    "locrian": "locrian",
+    "ionian": "major", "aeolian": "minor",
+    "dorian": "dorian", "phrygian": "phrygian",
+    "lydian": "lydian", "mixolydian": "mixolydian", "locrian": "locrian",
   }
   quality = mode_to_quality.get(mode_name.lower(), "major")
-  ks = m21key.Key(f"{key_name} {quality}")
+  try:
+    ks = m21key.Key(key_name, quality)
+  except Exception:
+    ks = m21key.Key(key_name, "minor" if quality == "aeolian" else "major")
 
-  lines = ["# Column Degrees → Chords", "",
-           f"Key: **{key_name} {quality}**  |  Mode: **{mode_name}**", ""]
+  lines = []
   lines.append("| Col | Degree | Roman | Root | Pitches |")
   lines.append("|---:|:------:|:-----:|:----:|:--------|")
   for i, deg in enumerate(deg_by_col[:5], 1):
-    rn = m21roman.RomanNumeral(deg, ks)
-    pitches = " ".join(p.nameWithOctave for p in rn.pitches[:4])
-    lines.append(f"| {i} | {deg} | {rn.figure} | {rn.root().name} | {pitches} |")
-  lines.append("")
-  return "\n".join(lines)
+    try:
+      rn = m21roman.RomanNumeral(deg, ks)
+      pitches = " ".join(p.nameWithOctave for p in rn.pitches[:4])
+      lines.append(f"| {i} | {deg} | {rn.figure} | {rn.root().name} | {pitches} |")
+    except Exception:
+      lines.append(f"| {i} | {deg} | (n/a) | (n/a) | (n/a) |")
+  return "\n".join(lines) + "\n"
+
+def load_curated_markdown(path: str) -> str:
+  if not os.path.exists(path):
+    raise FileNotFoundError(f"Curated genre source not found: {path}")
+  with open(path, "r", encoding="utf-8") as f:
+    return f.read()
+
+def build_sidecar_from_curated(curated_md: str,
+                               degs_for_chords: Sequence[str],
+                               key_name: str | None,
+                               mode_name: str | None) -> str:
+  """
+  The curated markdown is the source of truth.
+  If it contains the placeholder {{CHORD_TABLE}}, we replace it
+  with a realized chord table (if key+mode provided and music21 available).
+  If placeholder is absent, we leave the curated doc untouched.
+  """
+  if "{{CHORD_TABLE}}" not in curated_md:
+    return curated_md if curated_md.endswith("\n") else curated_md + "\n"
+
+  # Only generate a chord table when both key and mode are provided
+  chord_table = ""
+  if key_name and mode_name:
+    chord_table = realize_chords_md(degs_for_chords, key_name, mode_name)
+    if not chord_table:
+      chord_table = "> (music21 not available; chord table omitted)\n"
+
+  return curated_md.replace("{{CHORD_TABLE}}", chord_table)
 
 def genre_sheet_md(genre: str) -> str:
   g = GENRE_SHEETS.get(genre.lower())
@@ -473,48 +503,48 @@ def build_parser() -> argparse.ArgumentParser:
   )
 
   src = p.add_mutually_exclusive_group(required=True)
-  src.add_argument("--prog",
+  
+  src.add_argument('-pg',   "--prog",
                    help="Progression DSL, e.g. \"(ii-V-I-iv-III,(IV-V-VI-ii-I*4))*3\"")
-  src.add_argument("--preset",
+  src.add_argument('-pt',   "--preset",
                    help=f"One of: {', '.join(sorted(PRESET_DEGREES))}")
-  src.add_argument("--markov-preset",
+  src.add_argument('-mp',   "--markov-preset",
                    help=f"One of: {', '.join(sorted(MARKOV_PRESETS))}")
-  src.add_argument("--markov",
+  src.add_argument('-mv',   "--markov",
                    metavar="TRANS",
                    help="Inline Markov: \"I:V=0.6,vi=0.4; V:I=0.7,vi=0.3; vi:IV=1.0\"")
-
-  p.add_argument("--repeat", type=int, default=10,
+  p.add_argument('-r',  "--repeat", type=int, default=10,
                  help="Columns to generate for --preset (default 10)")
-  p.add_argument("--length", type=int, default=10,
+  p.add_argument('-l',  "--length", type=int, default=10,
                  help="Length for --markov sources (default 10)")
-  p.add_argument("--seed", type=int,
+  p.add_argument('-s',  "--seed", type=int,
                  help="Seed for Markov RNG")
-
-  p.add_argument("--mode", choices=list(MODE_TABLE.keys()),
-                 help="Validate degrees against this mode (optional).")
-  p.add_argument("--allow-borrowed", action="store_true",
+  p.add_argument('-ab', "--allow-borrowed", action="store_true",
                  help="Permit degrees outside the mode (leading b/# or not present in the mode).")
-  p.add_argument("--borrowed-to-custom",
+  p.add_argument('-bc', "--borrowed-to-custom",
                  choices=["custom1","custom2"],
                  help="Route borrowed degrees to this right-hand grid; Diatonic keeps in-mode only.")
-
-  p.add_argument("--key",
-                 help="If provided with --doc, use this tonic with music21 (e.g., C, Eb, A).")
-  p.add_argument("--doc",
-                 help="Write sidecar Markdown (realized chords + optional genre sheet).")
-  p.add_argument("--genre", choices=["hyperpop"],
-                 help="Include a studio one-pager for the genre in the --doc output.")
-
-  p.add_argument("--start-note", type=int, default=0,
+  p.add_argument('-k',  "--key",
+                help="If provided with --doc, use this tonic with music21 (e.g., C, Eb, A).")
+  p.add_argument('-m',  "--mode", choices=list(MODE_TABLE.keys()),
+                help="Validate degrees and realize chords for docs (optional).")
+  p.add_argument('-d',  "--doc",
+                help="Write sidecar Markdown from a curated source file (see --genre/--genre-src).")
+  p.add_argument('-g',  "--genre",
+                required=False,
+                help="Genre key used to find curated doc (e.g., 'hyperpop'). Required when --doc is set.")
+  p.add_argument('-gs', "--genre-src",
+                help="Path to curated source markdown. Default: ./genres/<genre>-source-information.md")
+  p.add_argument('-sn', "--start-note", type=int, default=0,
                  help="Base MIDI note for lane 1 (default 0 = C#-2).")
-  p.add_argument("--row-step", type=int, default=16,
+  p.add_argument('-rs', "--row-step", type=int, default=16,
                  help="Vertical spacing between rows (default 16).")
-  p.add_argument("--lane", action="append", default=[],
+  p.add_argument('-ln', "--lane", action="append", default=[],
                  help="Lane offsets per quality. Repeatable, e.g.: --lane 1:0 --lane 2:1 --lane 3:2 --lane 4:3 --lane 5:8")
-  p.add_argument("--mirror", choices=["all","diatonic","custom1","custom2"], default="all",
+  p.add_argument('-mr', "--mirror", choices=["all","diatonic","custom1","custom2"], default="all",
                  help="Which grid sections to emit (default: all).")
-
-  p.add_argument("-o", "--outfile", required=True, help="Output mapping file path.")
+  p.add_argument("-o",  "--outfile", required=True, help="Output mapping file path.")
+  p.add_argument("-p",  "--outpath", default="./output", help="path where to generate file output (default:./output/)")
   return p
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -600,35 +630,42 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.error(str(e))
     return 2
 
-  with open(args.outfile, "w", encoding="utf-8") as f:
+  with open(args.outpath + '/' +args.outfile, "w", encoding="utf-8") as f:
     f.write(text)
   print(f"Wrote {args.outfile}")
 
-  # Optional docs
-  if args.doc:
-    doc_parts: List[str] = []
-    # Realized chords table (use diatonic columns if present, else any section)
-    for choice in ["diatonic"] + [s for s in sections if s != "diatonic"]:
-      cols = section_to_cols.get(choice, [])
-      if cols:
-        # pick 5 visible columns
-        degs = _cycle_to_five(cols)
-        key_for_doc = args.key or "C"
-        mode_for_doc = args.mode or "ionian"
-        doc_parts.append(realize_chords_md(degs, key_for_doc, mode_for_doc))
-        break
-    # Genre sheet
-    if args.genre:
-      sheet = genre_sheet_md(args.genre)
-      if sheet:
-        doc_parts.append(sheet)
+ if args.doc:
+  if not args.genre:
+    parser.error("--doc requires --genre (so we know which curated file to load).")
+    return 2
 
-    md = "\n\n---\n\n".join([p.strip() for p in doc_parts if p.strip()]) + "\n"
-    with open(args.doc, "w", encoding="utf-8") as f:
-      f.write(md)
-    print(f"Wrote {args.doc}")
+  genre_src = args.genre_src or os.path.join("genres", f"{args.genre.lower()}-source-information.md")
+  try:
+    curated_md = load_curated_markdown(genre_src)
+  except FileNotFoundError as e:
+    parser.error(str(e) + "  (Create this file; the sidecar is curated-only by design.)")
+    return 2
 
-  return 0
+  # Pick 5 visible columns for chord table (if placeholder present)
+  # Prefer diatonic section if present
+  chosen_cols = None
+  for choice in ["diatonic"] + [s for s in sections if s != "diatonic"]:
+    cols = section_to_cols.get(choice, [])
+    if cols:
+      chosen_cols = _cycle_to_five(cols)
+      break
+  if chosen_cols is None:
+    chosen_cols = ["I","V","vi","IV","ii"]  # safe fallback
+
+  doc_text = build_sidecar_from_curated(
+    curated_md=curated_md,
+    degs_for_chords=chosen_cols,
+    key_name=args.key,
+    mode_name=args.mode
+  )
+  with open(args.outpath + '/' + args.doc, "w", encoding="utf-8") as f:
+    f.write(doc_text)
+  print(f"Wrote {args.doc} (from curated: {genre_src})")
 
 if __name__ == "__main__":
   sys.exit(main())
